@@ -2,6 +2,8 @@ import os
 import time
 from typing import List, Optional, Union, Dict, Any
 
+import json
+
 import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -35,6 +37,16 @@ class ResponseFormat(BaseModel):
     type: Optional[str] = None
 
 
+class ToolFunction(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+class Tool(BaseModel):
+    type: str = "function"
+    function: ToolFunction
+
+
 # ==================================================
 # ========(old) Chat Completion API endpoint========
 # ==================================================
@@ -51,6 +63,8 @@ class ChatCompletionRequest(BaseModel):
     seed: Optional[int] = None
     response_format: Optional[ResponseFormat] = None
     stream: Optional[bool] = None
+    tools: Optional[List[Tool]] = None
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
 
 
 def config_ok() -> Optional[JSONResponse]:
@@ -106,6 +120,12 @@ def build_upstream_payload(req: ChatCompletionRequest) -> Dict[str, Any]:
         payload["seed"] = req.seed
     if req.response_format is not None and req.response_format.type is not None:
         payload["responseFormat"] = {"type": req.response_format.type}
+
+    if req.tools is not None:
+        payload["tools"] = [t.model_dump() for t in req.tools]
+    if req.tool_choice is not None:
+        payload["toolChoice"] = req.tool_choice  # or "tool_choice" depending on upstream API casing
+
     return payload
 
 
@@ -139,6 +159,39 @@ def map_upstream_to_openai_like(
 
     created_ts = int(time.time())
     created_ms = int(time.time() * 1000)
+
+    # ---- NEW: parse tool_calls from upstream ----
+    # Adjust the keys below to match what YOUR upstream API actually returns.
+    # Common shapes: data.toolCalls, data.tool_calls, data.functionCall
+    raw_tool_calls = data.get("toolCalls") or data.get("tool_calls")
+
+    message: Dict[str, Any] = {
+        "role": role,
+        "content": content,  # can be None when tool_calls are present
+    }
+
+    if raw_tool_calls:
+        # Normalize to OpenAI tool_calls format
+        tool_calls = []
+        for i, tc in enumerate(raw_tool_calls):
+            # Handle both camelCase and snake_case from upstream
+            func = tc.get("function") or {}
+            tool_calls.append({
+                "id": tc.get("id") or f"call_{created_ms}_{i}",
+                "type": "function",
+                "function": {
+                    "name": func.get("name", ""),
+                    "arguments": func.get("arguments", "{}"),  # must be a JSON string
+                },
+            })
+        message["tool_calls"] = tool_calls
+        # When tool_calls are present, content may be null
+        if not content:
+            message["content"] = None
+        # OpenAI uses "tool_calls" as the finish_reason when tools are invoked
+        finish_reason = "tool_calls"
+
+
     openai_like = {
         "id": f"chatcmpl-{created_ms}",
         "object": "chat.completion",
@@ -147,10 +200,7 @@ def map_upstream_to_openai_like(
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": role,
-                    "content": content,
-                },
+                "message": message,
                 "finish_reason": finish_reason,
             }
         ],
@@ -268,7 +318,8 @@ class ResponsesRequest(BaseModel):
     seed: Optional[int] = None
     response_format: Optional[ResponseFormat] = None
     stream: Optional[bool] = None  # We only support non-streaming
-
+    tools: Optional[List[Any]] = None       # Accept tool definitions
+    tool_choice: Optional[Any] = None
 
 def _responses_to_chat_messages(req: ResponsesRequest) -> List[ChatMessage]:
     # Prefer explicit messages if provided
@@ -316,34 +367,53 @@ def _chat_to_responses(chat_obj: Dict[str, Any]) -> Dict[str, Any]:
     )
     finish_reason = first.get("finish_reason", "stop")
 
-    # Use 'end_turn' for best compatibility with Anthropic-style consumers
-    stop_reason = "end_turn" if finish_reason in ("stop", None) else finish_reason
+    tool_calls = message.get("tool_calls")
 
     usage = chat_obj.get("usage", {}) or {}
     input_tokens = usage.get("prompt_tokens", 0)
     output_tokens = usage.get("completion_tokens", 0)
     total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
 
+    # ---- NEW: build output items based on whether tool_calls exist ----
+    output_items = []
+
+    if tool_calls:
+        # Each tool call becomes a "function_call" output item (Responses API shape)
+        for tc in tool_calls:
+            func = tc.get("function", {})
+            output_items.append({
+                "id": tc.get("id", f"fc-{created_ms}"),
+                "type": "function_call",
+                "name": func.get("name", ""),
+                "arguments": func.get("arguments", "{}"),
+                "call_id": tc.get("id", f"call-{created_ms}"),
+                "status": "completed",
+            })
+        stop_reason = "tool_use"
+        output_text = content_text or ""
+    else:
+        # Normal text message
+        output_items.append({
+            "id": f"msg-{created_ms}",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": content_text},
+                {"type": "text", "text": content_text},
+            ],
+        })
+        stop_reason = "end_turn" if finish_reason in ("stop", None) else finish_reason
+        output_text = content_text
+
     return {
         "id": f"resp-{created_ms}",
         "object": "response",
-        "created": created_ts,  # numeric epoch
-        "created_at": _to_iso8601(created_ts),  # ISO8601
+        "created": created_ts,
+        "created_at": _to_iso8601(created_ts),
         "model": model,
         "status": "completed",
-        "output": [
-            {
-                "id": f"msg-{created_ms}",
-                "type": "message",
-                "role": "assistant",
-                "content": [
-                    # Include BOTH shapes to satisfy different LiteLLM transformers --> behaves a bit weird sometimes if not like this
-                    {"type": "output_text", "text": content_text},
-                    {"type": "text", "text": content_text},
-                ],
-            }
-        ],
-        "output_text": content_text,
+        "output": output_items,
+        "output_text": output_text,
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -393,6 +463,8 @@ async def responses(req: ResponsesRequest):
         seed=req.seed,
         response_format=req.response_format,
         stream=False,
+        tools=[Tool(**t) if isinstance(t, dict) else t for t in req.tools] if req.tools else None,
+        tool_choice=req.tool_choice,
     )
 
     # Build upstream payload identically to chat/completions
@@ -435,6 +507,7 @@ async def responses(req: ResponsesRequest):
                 )
 
             upstream_json = resp.json()
+            logger.debug(f"Upstream response: {json.dumps(upstream_json, indent=2, default=str)}")
 
             # map to chat/completion shape an then to responses shape
             chat_like = map_upstream_to_openai_like(
