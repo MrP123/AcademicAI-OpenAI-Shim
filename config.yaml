@@ -21,7 +21,7 @@ model_list:
       supports_streaming: false
 
 litellm_settings:
-  timeout: 60
+  timeout: 90
   num_retries: 0
   router_health_check: false
   use_responses_api: false
