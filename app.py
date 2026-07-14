@@ -13,6 +13,8 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import logging
 
+from tools import tool_write, tool_grep, tool_read
+
 load_dotenv()
 
 # Configuration from environment variables
@@ -43,22 +45,6 @@ class Tool(BaseModel):
     function: ToolFunction
 
 
-# Register your tools here: name -> (callable, json-schema-like params)
-# Each callable must accept **kwargs and return a serializable dict or string.
-def tool_write(file_path: str, content: str) -> Dict[str, Any]:
-    # EXAMPLE TOOL: Writes a file. Adjust path safety for your environment!
-
-    logger.info(f"Tool Write called with file_path={file_path}, content length={len(content)}")
-
-    try:
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return {"ok": True, "file_path": file_path, "bytes": len(content)}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
 TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "Write": {
         "callable": tool_write,
@@ -76,7 +62,113 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
         },
         "description": "Writes a file to the local filesystem.",
     },
-    # Add more tools here...
+    "Read": {
+        "callable": tool_read,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The absolute path to the file to read"
+                },
+                "offset": {
+                    "type": "number",
+                    "description": "The line number to start reading from. Only provide if the file is too large to read at once"
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "The number of lines to read. Only provide if the file is too large to read at once"
+                },
+            },
+            "required": ["file_path"],
+            "additionalProperties": False,
+        },
+        "description": (
+            "Reads a file from the local filesystem. You can access any file directly by using this tool. "
+            "Assume this tool is able to read all files on the machine. If the User provides a path to a file assume that path is valid. "
+            "It is okay to read a file that does not exist; an error will be returned.\n\n"
+            "Usage:\n"
+            "- The file_path parameter must be an absolute path, not a relative path\n"
+            "- By default, it reads up to 2000 lines starting from the beginning of the file\n"
+            "- You can optionally specify a line offset and limit (especially handy for long files), "
+            "but it's recommended to read the whole file by not providing these parameters\n"
+            "- Any lines longer than 2000 characters will be truncated\n"
+            "- Results are returned using cat -n format, with line numbers starting at 1\n"
+            "- This tool can only read files, not directories. To read a directory, use the Grep tool.\n"
+            "- You can call multiple tools in a single response. It is always better to speculatively read multiple potentially useful files in parallel.\n"
+            "- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents."
+        ),
+    },
+    "Grep": {
+        "callable": tool_grep,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "The regular expression pattern to search for in file contents"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File or directory to search (defaults to current working directory)"
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "Glob filter for files (e.g., \"*.js\", \".{ts,tsx}\")"
+                },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["content", "files_with_matches", "count"],
+                    "description": "Output mode"
+                },
+                "-B": {
+                    "type": "integer",
+                    "description": "Lines to show Before each match (content mode only)"
+                },
+                "-A": {
+                    "type": "integer",
+                    "description": "Lines to show After each match (content mode only)"
+                },
+                "-C": {
+                    "type": "integer",
+                    "description": "Lines to show before and after (content mode only)"
+                },
+                "-n": {
+                    "type": "boolean",
+                    "description": "Show line numbers in output (content mode). Defaults to true."
+                },
+                "-i": {
+                    "type": "boolean",
+                    "description": "Case insensitive search"
+                },
+                "type": {
+                    "type": "string",
+                    "description": "File type to search (e.g., js, py, rust). More efficient than glob for common types."
+                },
+                "head_limit": {
+                    "type": "integer",
+                    "description": "Limit output to first N lines/entries after offset"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Skip first N lines/entries before applying head_limit"
+                },
+                "multiline": {
+                    "type": "boolean",
+                    "description": "Enable multiline mode where . matches newlines and patterns can span lines"
+                },
+            },
+            "required": ["pattern"],
+            "additionalProperties": False,
+        },
+        "description": (
+            "A powerful search tool built on ripgrep semantics (local implementation). "
+            "Usage: ALWAYS use Grep for search tasks. Supports regex, glob/type filters, "
+            "output modes (content, files_with_matches, count), context (-A/-B/-C), "
+            "line numbers (-n), case-insensitive (-i), head_limit/offset windowing, "
+            "and multiline (dotall) matching."
+        ),
+    },
 }
 
 # The protocol we’ll instruct the model to use when it wants a tool:
@@ -134,10 +226,15 @@ def execute_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     entry = TOOL_REGISTRY.get(name)
 
     if not entry:
+        logger.debug(f"Unknown tool requested: {name}")
         return {"ok": False, "error": f"Unknown tool: {name}"}
+
     fn = entry["callable"]
     try:
         result = fn(**arguments)
+
+        #logger.info(f"Executed tool {name} with arguments={arguments}, result={result}")
+
         # Ensure it is JSON-serializable
         if isinstance(result, (str, int, float, bool)) or result is None:
             return {"ok": True, "result": result}
@@ -600,33 +697,18 @@ async def chat_completions(req: ChatCompletionRequest):
                 )
 
             upstream_json = result["final_upstream"]
-            tool_calls = result["tool_calls"]
 
-            # Map upstream to OpenAI-like
-            chat_like = map_upstream_to_openai_like(
-                upstream_json, request_model=req.model
-            )
+            # Map upstream to OpenAI-like and return as a normal assistant message
+            chat_like = map_upstream_to_openai_like(upstream_json, request_model=req.model)
 
-            # Inject tool_calls into the first choice message if we had any
-            if tool_calls:
-                msg = chat_like["choices"][0]["message"]
-                msg["tool_calls"] = [
-                    {
-                        "id": tc["id"],
-                        "type": "function",
-                        "function": tc["function"],
-                    }
-                    for tc in tool_calls
-                ]
-                # If model’s text was only the tool block, set content None like OpenAI
-                if isinstance(msg.get("content"), str) and TOOL_CALL_PATTERN.search(
-                    msg["content"]
-                ):
-                    msg["content"] = None
-                # Set finish_reason to "tool_calls" to mirror OpenAI
-                chat_like["choices"][0]["finish_reason"] = "tool_calls"
+            # Ensure no tool_calls are present since we already executed them locally
+            msg = chat_like["choices"][0]["message"]
+            if "tool_calls" in msg:
+                msg.pop("tool_calls", None)
+            chat_like["choices"][0]["finish_reason"] = "stop"
 
             return JSONResponse(status_code=200, content=chat_like)
+
         except httpx.TimeoutException:
             return JSONResponse(
                 status_code=504,
@@ -925,22 +1007,17 @@ async def responses(req: ResponsesRequest):
             )
 
         upstream_json = result["final_upstream"]
-        tool_calls = result["tool_calls"]
 
-        # Map to OpenAI chat-like and inject tool_calls so we can convert to Responses
+        # Map to OpenAI chat-like (no tool_calls included, since we executed them)
         chat_like = map_upstream_to_openai_like(upstream_json, request_model=req.model)
-        if tool_calls:
-            msg = chat_like["choices"][0]["message"]
-            msg["tool_calls"] = [
-                {"id": tc["id"], "type": "function", "function": tc["function"]}
-                for tc in tool_calls
-            ]
-            # If the assistant text only contained the fenced tool JSON, set content to None
-            if isinstance(msg.get("content"), str) and TOOL_CALL_PATTERN.search(msg["content"]):
-                msg["content"] = None
-            chat_like["choices"][0]["finish_reason"] = "tool_calls"
+        msg = chat_like["choices"][0]["message"]
+        if "tool_calls" in msg:
+            msg.pop("tool_calls", None)
+        chat_like["choices"][0]["finish_reason"] = "stop"
 
         responses_obj = _chat_to_responses(chat_like)
+        # Force stop_reason to end_turn for a finalized assistant message
+        responses_obj["stop_reason"] = "end_turn"
         return JSONResponse(status_code=200, content=responses_obj)
 
     # ---------- No tools: fall back to the upstream path ----------
