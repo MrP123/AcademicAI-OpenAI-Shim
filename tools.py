@@ -4,11 +4,21 @@ import os
 import fnmatch
 import re
 import mimetypes
+import time
 
 logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.DEBUG)
 
-# Register your tools here: name -> (callable, json-schema-like params)
+
+# Tracks files that were read via the Read tool in this process
+READ_HISTORY: Dict[str, float] = {}  # file_path -> last_read_timestamp
+
+
+# Helpful docs on all Claude Code tools
+# https://blog.thepete.net/claude-code-tools/#read
+
+
+# Register your tools with: name -> (callable, json-schema-like params)
 # Each callable must accept **kwargs and return a serializable dict or string.
 def tool_write(file_path: str, content: str) -> Dict[str, Any]:
     # EXAMPLE TOOL: Writes a file. Adjust path safety for your environment!
@@ -23,8 +33,126 @@ def tool_write(file_path: str, content: str) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+def tool_edit(
+    file_path: str,
+    old_string: str,
+    new_string: str,
+    replace_all: Optional[bool] = False,
+    encoding: str = "utf-8",
+) -> Dict[str, Any]:
+    """
+    Performs exact string replacements in files.
 
+    Enforced rules:
+    - file_path must be absolute and point to an existing regular file
+    - Must have been read via the Read tool at least once in this process (READ_HISTORY)
+    - old_string and new_string must be non-empty and different
+    - If replace_all is False:
+        - exactly one occurrence must exist, otherwise the edit FAILS
+      If replace_all is True:
+        - all occurrences are replaced; if zero found, returns ok=False with error
 
+    Notes for the caller (Claude):
+    - When editing using Read tool output (cat -n format), never include the line number prefix in old_string/new_string.
+      Only include the content after the tab.
+    """
+    try:
+        # Validate inputs
+        if not isinstance(file_path, str) or not file_path:
+            return {"ok": False, "error": "file_path (string) is required"}
+        if not os.path.isabs(file_path):
+            return {"ok": False, "error": "file_path must be an absolute path"}
+        if not os.path.exists(file_path):
+            return {"ok": False, "error": f"File not found: {file_path}"}
+        if not os.path.isfile(file_path):
+            return {"ok": False, "error": f"Not a regular file: {file_path}"}
+
+        if not isinstance(old_string, str) or old_string == "":
+            return {"ok": False, "error": "old_string (non-empty string) is required"}
+        if not isinstance(new_string, str) or new_string == "":
+            return {"ok": False, "error": "new_string (non-empty string) is required"}
+        if old_string == new_string:
+            return {"ok": False, "error": "new_string must be different from old_string"}
+
+        # Enforce "must have used Read at least once in the conversation"
+        # We approximate this by requiring that this process has recorded a Read of the file.
+        last_read = READ_HISTORY.get(file_path)
+        if last_read is None:
+            return {
+                "ok": False,
+                "error": (
+                    "Edit denied: you must use the Read tool on this file at least once before editing. "
+                    "Please call Read and then retry the edit."
+                ),
+            }
+
+        # Read the file content
+        try:
+            with open(file_path, "r", encoding=encoding, errors="strict") as fh:
+                original = fh.read()
+        except UnicodeDecodeError:
+            # Retry with replace to avoid failure, but warn
+            with open(file_path, "r", encoding=encoding, errors="replace") as fh:
+                original = fh.read()
+
+        occurrences = original.count(old_string)
+
+        if replace_all:
+            if occurrences == 0:
+                return {
+                    "ok": False,
+                    "error": "No occurrences of old_string found in file. Nothing to replace.",
+                    "occurrences": 0,
+                }
+            new_content = original.replace(old_string, new_string)
+            updated = (new_content != original)
+            if not updated:
+                return {"ok": False, "error": "Replacement produced no change (unexpected)."}
+            # Write back
+            with open(file_path, "w", encoding=encoding, errors="replace") as fh:
+                fh.write(new_content)
+            return {
+                "ok": True,
+                "file_path": file_path,
+                "mode": "replace_all",
+                "occurrences_replaced": occurrences,
+                "bytes_before": len(original.encode(encoding, errors="replace")),
+                "bytes_after": len(new_content.encode(encoding, errors="replace")),
+            }
+        else:
+            # Must be exactly one occurrence
+            if occurrences == 0:
+                return {
+                    "ok": False,
+                    "error": "old_string not found in file. Provide more context or use replace_all if appropriate.",
+                    "occurrences": 0,
+                }
+            if occurrences > 1:
+                return {
+                    "ok": False,
+                    "error": (
+                        "Edit failed: old_string matched multiple locations. "
+                        "Provide a longer old_string with more surrounding context or set replace_all=true."
+                    ),
+                    "occurrences": occurrences,
+                }
+            # Replace exactly once
+            new_content = original.replace(old_string, new_string, 1)
+            if new_content == original:
+                return {"ok": False, "error": "Replacement produced no change (unexpected)."}
+            with open(file_path, "w", encoding=encoding, errors="replace") as fh:
+                fh.write(new_content)
+            return {
+                "ok": True,
+                "file_path": file_path,
+                "mode": "single",
+                "occurrences_replaced": 1,
+                "bytes_before": len(original.encode(encoding, errors="replace")),
+                "bytes_after": len(new_content.encode(encoding, errors="replace")),
+            }
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 def tool_read(
     file_path: str,
@@ -88,7 +216,7 @@ def tool_read(
         ipynb_exts = {".ipynb"}
         _, ext = os.path.splitext(file_path.lower())
 
-        if (mime and not is_probably_text) or ext in visual_exts or ext in pdf_exts or ext in ipynb_exts:
+        if ((mime and not is_probably_text) or ext in visual_exts or ext in pdf_exts or ext in ipynb_exts):
             # Return a descriptive note for visual/binary content
             kind = "binary"
             if ext in visual_exts:
@@ -104,6 +232,8 @@ def tool_read(
                 "[Read] Contents are visual/binary and will be interpreted by the client.",
             ]
             output_text = "\n".join(note_lines)
+
+            READ_HISTORY[file_path] = time.time()
             return {
                 "ok": True,
                 "file_path": file_path,
@@ -144,6 +274,7 @@ def tool_read(
 
         # Handle empty file: system reminder instead of content
         if total_lines == 0:
+            READ_HISTORY[file_path] = time.time()
             return {
                 "ok": True,
                 "file_path": file_path,
@@ -156,6 +287,7 @@ def tool_read(
                 "truncated_lines": 0,
             }
 
+        READ_HISTORY[file_path] = time.time()
         return {
             "ok": True,
             "file_path": file_path,
@@ -169,11 +301,12 @@ def tool_read(
         }
 
     except Exception as e:
-        return {"ok": False, "error": str(e)} 
+        return {"ok": False, "error": str(e)}
 
-#========================
-#==========GREP==========
-#========================
+
+# ========================
+# ==========GREP==========
+# ========================
 
 
 # Subset map for --type like ripgrep; extend as needed
@@ -203,6 +336,7 @@ _RG_TYPE_MAP: Dict[str, List[str]] = {
     # add more on demand
 }
 
+
 def _expand_brace_glob(glob_pattern: str) -> List[str]:
     """
     Expand simple brace sets like .{ts,tsx} into [".ts", ".tsx"].
@@ -219,6 +353,7 @@ def _expand_brace_glob(glob_pattern: str) -> List[str]:
     except Exception:
         return [glob_pattern]
 
+
 def _iter_files(start_path: str) -> List[str]:
     if os.path.isfile(start_path):
         return [os.path.abspath(start_path)]
@@ -227,6 +362,7 @@ def _iter_files(start_path: str) -> List[str]:
         for fname in filenames:
             paths.append(os.path.join(dirpath, fname))
     return paths
+
 
 def _passes_glob(path: str, root: str, glob_pat: Optional[str]) -> bool:
     if not glob_pat:
@@ -238,6 +374,7 @@ def _passes_glob(path: str, root: str, glob_pat: Optional[str]) -> bool:
             return True
     return False
 
+
 def _passes_type(path: str, type_name: Optional[str]) -> bool:
     if not type_name:
         return True
@@ -248,6 +385,7 @@ def _passes_type(path: str, type_name: Optional[str]) -> bool:
     _, ext = os.path.splitext(path.lower())
     return ext in exts
 
+
 def _compile_pattern(pattern: str, ignore_case: bool, multiline: bool) -> re.Pattern:
     flags = 0
     if ignore_case:
@@ -256,6 +394,7 @@ def _compile_pattern(pattern: str, ignore_case: bool, multiline: bool) -> re.Pat
         flags |= re.DOTALL  # dot matches newline
     return re.compile(pattern, flags)
 
+
 def _line_start_indices(text: str) -> List[int]:
     """Return list of indices where each line starts to compute line numbers quickly."""
     idxs = [0]
@@ -263,6 +402,7 @@ def _line_start_indices(text: str) -> List[int]:
         if ch == "\n":
             idxs.append(i + 1)
     return idxs
+
 
 def _pos_to_line_col(pos: int, line_starts: List[int]) -> int:
     """Binary search to map byte/char index to 1-based line number."""
@@ -274,6 +414,7 @@ def _pos_to_line_col(pos: int, line_starts: List[int]) -> int:
         else:
             hi = mid - 1
     return hi + 1  # 1-based line
+
 
 def tool_grep(**kwargs) -> Dict[str, Any]:
     """
@@ -310,7 +451,10 @@ def tool_grep(**kwargs) -> Dict[str, Any]:
         glob_pat = take("glob")
         output_mode = take("output_mode") or "files_with_matches"
         if output_mode not in ("content", "files_with_matches", "count"):
-            return {"ok": False, "error": "output_mode must be one of: content, files_with_matches, count"}
+            return {
+                "ok": False,
+                "error": "output_mode must be one of: content, files_with_matches, count",
+            }
 
         # Context options (content mode)
         c_before = take("-B")
@@ -359,7 +503,9 @@ def tool_grep(**kwargs) -> Dict[str, Any]:
             # Type/glob filters
             if not _passes_type(fpath, type_name):
                 continue
-            root_for_rel = start_path if os.path.isdir(start_path) else os.path.dirname(start_path)
+            root_for_rel = (
+                start_path if os.path.isdir(start_path) else os.path.dirname(start_path)
+            )
             if not _passes_glob(fpath, root_for_rel, glob_pat):
                 continue
 
@@ -386,14 +532,27 @@ def tool_grep(**kwargs) -> Dict[str, Any]:
                         # Emit before
                         for ln in range(start_line, line_num):
                             if show_line_numbers:
-                                content_lines.append(f"{fpath}-{ln}-{text[line_starts[ln-1]:text.find('\\n', line_starts[ln-1]) if text.find('\\n', line_starts[ln-1])!=-1 else len(text)].rstrip()}")
+                                content_lines.append(
+                                    f"{fpath}-{ln}-{text[line_starts[ln - 1] : text.find('\\n', line_starts[ln - 1]) if text.find('\\n', line_starts[ln - 1]) != -1 else len(text)].rstrip()}"
+                                )
                             else:
-                                content_lines.append(f"{fpath}-" + text[line_starts[ln-1]:text.find('\n', line_starts[ln-1]) if text.find('\n', line_starts[ln-1])!=-1 else len(text)].rstrip())
+                                content_lines.append(
+                                    f"{fpath}-"
+                                    + text[
+                                        line_starts[ln - 1] : text.find(
+                                            "\n", line_starts[ln - 1]
+                                        )
+                                        if text.find("\n", line_starts[ln - 1]) != -1
+                                        else len(text)
+                                    ].rstrip()
+                                )
                         # Emit match line
                         match_line_end = text.find("\n", line_starts[line_num - 1])
                         if match_line_end == -1:
                             match_line_end = len(text)
-                        line_text = text[line_starts[line_num - 1]:match_line_end].rstrip()
+                        line_text = text[
+                            line_starts[line_num - 1] : match_line_end
+                        ].rstrip()
                         if show_line_numbers:
                             content_lines.append(f"{fpath}:{line_num}:{line_text}")
                         else:
@@ -401,9 +560,20 @@ def tool_grep(**kwargs) -> Dict[str, Any]:
                         # Emit after
                         for ln in range(line_num + 1, end_line + 1):
                             if show_line_numbers:
-                                content_lines.append(f"{fpath}+{ln}+{text[line_starts[ln-1]:text.find('\\n', line_starts[ln-1]) if text.find('\\n', line_starts[ln-1])!=-1 else len(text)].rstrip()}")
+                                content_lines.append(
+                                    f"{fpath}+{ln}+{text[line_starts[ln - 1] : text.find('\\n', line_starts[ln - 1]) if text.find('\\n', line_starts[ln - 1]) != -1 else len(text)].rstrip()}"
+                                )
                             else:
-                                content_lines.append(f"{fpath}+" + text[line_starts[ln-1]:text.find('\n', line_starts[ln-1]) if text.find('\n', line_starts[ln-1])!=-1 else len(text)].rstrip())
+                                content_lines.append(
+                                    f"{fpath}+"
+                                    + text[
+                                        line_starts[ln - 1] : text.find(
+                                            "\n", line_starts[ln - 1]
+                                        )
+                                        if text.find("\n", line_starts[ln - 1]) != -1
+                                        else len(text)
+                                    ].rstrip()
+                                )
             else:
                 # Line-by-line search
                 lines = text.splitlines()
@@ -417,9 +587,9 @@ def tool_grep(**kwargs) -> Dict[str, Any]:
                         # Before context
                         for ln in range(max(1, idx - c_before), idx):
                             if show_line_numbers:
-                                content_lines.append(f"{fpath}-{ln}-{lines[ln-1]}")
+                                content_lines.append(f"{fpath}-{ln}-{lines[ln - 1]}")
                             else:
-                                content_lines.append(f"{fpath}-{lines[ln-1]}")
+                                content_lines.append(f"{fpath}-{lines[ln - 1]}")
                         # Match line
                         if show_line_numbers:
                             content_lines.append(f"{fpath}:{idx}:{line}")
@@ -428,9 +598,9 @@ def tool_grep(**kwargs) -> Dict[str, Any]:
                         # After context
                         for ln in range(idx + 1, min(len(lines), idx + c_after) + 1):
                             if show_line_numbers:
-                                content_lines.append(f"{fpath}+{ln}+{lines[ln-1]}")
+                                content_lines.append(f"{fpath}+{ln}+{lines[ln - 1]}")
                             else:
-                                content_lines.append(f"{fpath}+{lines[ln-1]}")
+                                content_lines.append(f"{fpath}+{lines[ln - 1]}")
 
             if hits_in_file > 0:
                 files_with_hits.append(fpath)
