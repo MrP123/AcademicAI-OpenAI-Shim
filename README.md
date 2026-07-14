@@ -35,3 +35,11 @@ $env:ANTHROPIC_SMALL_FAST_MODEL="aai_gpt-5-nano"  # background tasks
 $env:ANTHROPIC_API_KEY=""                         # keep empty so Claude Code does not fall back to Anthropic or forces you to log in
 claude
 ```
+
+As the AcademicAI API does not support tool calling, the following tools are provided manually/locally in this shim to get a basic Claude Code workflow going. This is not ideal, but in practice not as limiting as one might suspect.
+The provided tools are:
+- `Write`: Writes a text file with the given content
+- `Read`: Reads a (text) file and returns its content
+- `Edit`: Performs exact string replacement in a text file
+- `Grep`: Searches for a regex pattern in a text file and returns the matching lines
+It uses a special text format with a fenced JSON block to communicate with the tools
