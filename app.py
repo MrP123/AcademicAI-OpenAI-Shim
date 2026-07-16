@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import logging
 
-from tools import tool_write, tool_edit, tool_read, tool_grep
+from tools import tool_write, tool_edit, tool_read, tool_delete, tool_grep
 
 load_dotenv()
 
@@ -22,7 +22,7 @@ BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 CLIENT_ID = os.environ.get("CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "")
 PORT = int(os.environ.get("PORT", "8081"))
-TIMEOUT_SECONDS = float(os.environ.get("TIMEOUT_SECONDS", "90"))
+TIMEOUT_SECONDS = float(os.environ.get("TIMEOUT_SECONDS", "120"))
 
 logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.DEBUG)
@@ -60,7 +60,14 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
             "required": ["file_path", "content"],
             "additionalProperties": False,
         },
-        "description": "Writes a file to the local filesystem.",
+        "description": (
+            "Writes a file to the local filesystem."
+            "Usage:\n"
+            "- The file_path parameter must be an absolute path, not a relative path\n"
+            "- If the file already exists, it will be overwritten\n"
+            "- If the file does not exist, it will be created along with any necessary parent directories\n"
+            "- Always prefer editing existing files in the codebase. Never write new files unless explicitly required.\n"
+        ),
     },
     "Edit": {
         "callable": tool_edit,
@@ -138,6 +145,32 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
             "- This tool can only read files, not directories. To read a directory, use the Grep tool.\n"
             "- You can call multiple tools in a single response. It is always better to speculatively read multiple potentially useful files in parallel.\n"
             "- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents."
+        ),
+    },
+    "Delete": {
+        "callable": tool_delete,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The absolute path to the file to delete"
+                },
+                "allow_missing": {
+                    "type": "boolean",
+                    "description": "If true, succeed even if the file does not exist (removed=false)"
+                },
+            },
+            "required": ["file_path"],
+            "additionalProperties": False,
+        },
+        "description": (
+            "Deletes a file from the local filesystem.\n\n"
+            "Usage:\n"
+            "- The file_path parameter must be an absolute path, not a relative path\n"
+            "- Deletes regular files and symlinks (removes only the link, not the target)\n"
+            "- Does NOT delete directories\n"
+            "- Use allow_missing=true if deletion should be considered successful when the file is absent"
         ),
     },
     "Grep": {
@@ -225,6 +258,7 @@ def build_tools_system_prompt(tools: Optional[List[Tool]]) -> str:
     if not tools:
         return ""
     lines = [
+        "# Tool Calling Protocol:",
         "You can use the following tools by requesting them in a single fenced JSON block.",
         "When you want to call a tool, respond ONLY with:",
         "```tool",
@@ -235,8 +269,19 @@ def build_tools_system_prompt(tools: Optional[List[Tool]]) -> str:
         "- arguments must be valid JSON.",
         "- After receiving the tool result, continue your answer normally.",
         "",
-        "Available tools:",
+        "# Available tools:",
     ]
+
+    for t, entry in TOOL_REGISTRY.items():
+        schema = entry.get("schema") or {"type": "object", "properties": {}}
+        lines.append(f"## {t}:")
+        lines.append(f"### Description: {entry.get('description', '')}")
+        lines.append(f"### Schema:\n{json.dumps(schema, ensure_ascii=False)}\n")
+
+    lines.append("")
+    lines.append("You can also use the following tools provided in the request, unless there is a conflict with the available tools from before")
+    lines.append("# Available tools from request:")
+
     for t in tools:
         f = t.function
         schema = f.parameters or {"type": "object", "properties": {}}
@@ -509,6 +554,7 @@ async def run_with_local_tools(
 
     # Build messages with tool system prompt
     tool_sys = build_tools_system_prompt(tools) if tools else ""
+
     messages = list(base_messages)
     if tools and tool_sys:
         messages = [ChatMessage(role="system", content=tool_sys)] + messages
@@ -575,7 +621,7 @@ async def run_with_local_tools(
                 name = call["name"]
                 args = call["arguments"]
 
-                logger.info(f"Executing tool call {i+1}/{len(calls)}: {name} with args={args}")
+                logger.info(f"Executing tool call {i+1}/{len(calls)}:\n  {name} with args={args}")
 
                 result = execute_tool_call(name, args)
 

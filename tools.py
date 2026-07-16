@@ -23,7 +23,7 @@ READ_HISTORY: Dict[str, float] = {}  # file_path -> last_read_timestamp
 def tool_write(file_path: str, content: str) -> Dict[str, Any]:
     # EXAMPLE TOOL: Writes a file. Adjust path safety for your environment!
 
-    logger.info(f"Tool Write called with file_path={file_path}, content length={len(content)}")
+    #logger.info(f"Tool Write called with file_path={file_path}, content length={len(content)}")
 
     try:
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -303,6 +303,101 @@ def tool_read(
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+
+def tool_delete(
+    file_path: str,
+    allow_missing: Optional[bool] = False,
+) -> Dict[str, Any]:
+    """
+    Deletes a file from the local filesystem.
+
+    Behavior:
+    - file_path must be an absolute path
+    - Deletes regular files and symlinks (removes the link, not the target)
+    - Does NOT delete directories
+    - If allow_missing is True and the file doesn't exist, returns ok=True, removed=False
+    - Returns metadata including whether it was a symlink and the size (best-effort)
+
+    Returns:
+      {
+        "ok": True,
+        "file_path": "<path>",
+        "removed": True|False,
+        "was_symlink": True|False,
+        "bytes": <int|None>,
+      }
+    or on error:
+      {"ok": False, "error": "<message>"}
+    """
+    try:
+        if not isinstance(file_path, str) or not file_path:
+            return {"ok": False, "error": "file_path (string) is required"}
+        if not os.path.isabs(file_path):
+            return {"ok": False, "error": "file_path must be an absolute path"}
+
+        # Not found handling
+        if not os.path.exists(file_path) and not os.path.islink(file_path):
+            if allow_missing:
+                return {
+                    "ok": True,
+                    "file_path": file_path,
+                    "removed": False,
+                    "was_symlink": False,
+                    "bytes": None,
+                    "note": "File did not exist",
+                }
+            return {"ok": False, "error": f"File not found: {file_path}"}
+
+        # Disallow directories
+        if os.path.isdir(file_path) and not os.path.islink(file_path):
+            return {"ok": False, "error": "Refuses to delete directories. Only files and symlinks are allowed."}
+
+        was_symlink = os.path.islink(file_path)
+
+        # Best-effort size (for symlinks, lstat size; for files, actual size)
+        try:
+            if was_symlink:
+                st = os.lstat(file_path)
+                size_bytes = st.st_size
+            else:
+                size_bytes = os.path.getsize(file_path)
+        except Exception:
+            size_bytes = None
+
+        # Try to make file writable if needed
+        try:
+            os.chmod(file_path, 0o666)
+        except Exception:
+            pass
+
+        # Remove file or symlink
+        os.remove(file_path)
+
+        return {
+            "ok": True,
+            "file_path": file_path,
+            "removed": True,
+            "was_symlink": was_symlink,
+            "bytes": size_bytes,
+        }
+
+    except PermissionError as e:
+        return {"ok": False, "error": f"Permission denied: {e}"}
+    except IsADirectoryError:
+        return {"ok": False, "error": "Refuses to delete directories. Only files and symlinks are allowed."}
+    except FileNotFoundError:
+        if allow_missing:
+            return {
+                "ok": True,
+                "file_path": file_path,
+                "removed": False,
+                "was_symlink": False,
+                "bytes": None,
+                "note": "File did not exist",
+            }
+        return {"ok": False, "error": f"File not found: {file_path}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 # ========================
 # ==========GREP==========
