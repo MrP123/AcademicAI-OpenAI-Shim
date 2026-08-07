@@ -413,15 +413,8 @@ def _normalize_messages_for_upstream(messages: List[ChatMessage]) -> List[Dict[s
     return out
 
 
-# ==================================================
-# ============== Prompt-size pruning ===============
-# ==================================================
 
-# TODO: check if working as intended
-# Budget in characters (adjust to your comfort). 120k chars ~ 30k-40k tokens for many BPEs.
-MAX_PROMPT_CHARS = 120_000
-# Keep this many most-recent tool result messages even if we are over budget.
-KEEP_RECENT_TOOL_RESULTS = 1
+KEEP_RECENT_TOOL_RESULTS = 2
 
 def _is_tool_result_message(m: ChatMessage) -> bool:
     """
@@ -441,80 +434,6 @@ def _is_tool_result_message(m: ChatMessage) -> bool:
     if text.startswith("[") and " result]" in text:
         return True
     return False
-
-def _prune_messages_for_budget(messages: List[ChatMessage],
-                               max_chars: int = MAX_PROMPT_CHARS,
-                               keep_recent_tool_results: int = KEEP_RECENT_TOOL_RESULTS,
-                               tool_sys_text: Optional[str] = None) -> List[ChatMessage]:
-    """
-    Prune older, large tool-result messages and (optionally) the tool system prompt
-    to keep the prompt under a character budget.
-
-    Strategy:
-    - Compute total char length of all messages (after normalization to text).
-    - If over budget, drop older tool-result messages first, keeping the newest N.
-    - If still over budget and tool system prompt is present, drop it after we have used any tool.
-    - As a last resort (rare), drop more old tool-result messages until under budget.
-    """
-    # First pass: gather indices and sizes
-    totals: List[int] = []
-    tool_result_indices: List[int] = []
-    for idx, m in enumerate(messages):
-        sz = len(_content_to_text(m.content))
-        totals.append(sz)
-        if _is_tool_result_message(m):
-            tool_result_indices.append(idx)
-
-    total_chars = sum(totals)
-    if total_chars <= max_chars:
-        return messages
-
-    # Step 1: drop older tool result messages, keep last 'keep_recent_tool_results'
-    to_drop: set[int] = set()
-    if tool_result_indices:
-        # Which ones to keep
-        keep_set = set(tool_result_indices[-keep_recent_tool_results:]) if keep_recent_tool_results > 0 else set()
-        # Propose dropping the older ones
-        for i in tool_result_indices:
-            if i not in keep_set:
-                to_drop.add(i)
-
-    # Apply drop and re-check size
-    if to_drop:
-        new_messages = [m for idx, m in enumerate(messages) if idx not in to_drop]
-        new_total = sum(len(_content_to_text(m.content)) for m in new_messages)
-        if new_total <= max_chars:
-            return new_messages
-        messages = new_messages
-        total_chars = new_total
-
-    # Step 2: if still over budget, and we’ve already used at least one tool,
-    # drop the tool system prompt if it’s present.
-    if tool_sys_text:
-        # We only drop it after there has been at least one tool result (i.e., protocol learned)
-        if any(_is_tool_result_message(m) for m in messages):
-            # find exact matching system prompt message
-            for idx, m in enumerate(messages):
-                if _content_to_text(m.content) == tool_sys_text:
-                    messages = messages[:idx] + messages[idx+1:]
-                    break
-            total_chars = sum(len(_content_to_text(m.content)) for m in messages)
-            if total_chars <= max_chars:
-                return messages
-
-    # Step 3: last resort — drop more old tool-result messages (if any remain), oldest first
-    # Walk from oldest to newest, dropping tool results until under budget
-    for idx, m in enumerate(messages):
-        if _is_tool_result_message(m):
-            candidate = messages[:idx] + messages[idx+1:]
-            new_total = sum(len(_content_to_text(mm.content)) for mm in candidate)
-            messages = candidate
-            total_chars = new_total
-            if total_chars <= max_chars:
-                break
-
-    return messages
-
 
 # ==================================================
 # ========(old) Chat Completion API endpoint========
@@ -672,19 +591,6 @@ async def run_with_local_tools(
     async with httpx.AsyncClient(timeout=timeout) as client:
         for iteration in range(max_tool_iterations + 1):
 
-            # PRUNE HERE: keep the prompt under a budget. This will drop older tool results and,
-            # after first tool use, the initial tool system prompt.
-            before_chars = sum(len(_content_to_text(m.content)) for m in messages)
-            messages = _prune_messages_for_budget(
-                messages,
-                max_chars=MAX_PROMPT_CHARS,
-                keep_recent_tool_results=KEEP_RECENT_TOOL_RESULTS,
-                tool_sys_text=(tool_sys_prompt if tools and tool_sys_prompt else None),
-            )
-            after_chars = sum(len(_content_to_text(m.content)) for m in messages)
-            if after_chars < before_chars:
-                logger.debug(f"Pruned prompt from {before_chars} to {after_chars} chars")
-
             # Call upstream once with normalized messages
             payload = {
                 "model": req_model,
@@ -767,12 +673,13 @@ async def run_with_local_tools(
                     )
                 )
 
-            # After appending tool results for the first time, drop the tool system prompt to save tokens
+            # After appending tool results for the first 2 times, drop the tool system prompt to save tokens
             # TODO: double check if ok
-            if tools and tool_sys_prompt and any(_is_tool_result_message(m) for m in messages):
+            if tools and tool_sys_prompt and sum(_is_tool_result_message(m) for m in messages) >= KEEP_RECENT_TOOL_RESULTS:
                 for i, m in enumerate(messages):
                     if _content_to_text(m.content) == tool_sys_prompt:
                         messages.pop(i)
+                        logger.debug("Removed tool system prompt after reaching KEEP_RECENT_TOOL_RESULTS")
                         break
 
         # Iteration cap reached
